@@ -4,17 +4,21 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include <ctype.h>
 
 __sfr __at 0x18 PORT0;
 __sfr __at 0x19 PORT1;
 __sfr __at 0x1a PORT2;
 __sfr __at 0x1b PORT3;
 __sfr __at 0x1c RESET;
-__sfr __at 0x99 VDP1;
 __sfr __at 0xa9 PPIB;
 __sfr __at 0xaa PPIC;
 
+#define RDSLT	0x000c
+#define CALSLT	0x001c
+
 #define RG1SAV	0xf3e0
+#define EXPTBL	0xfcc1
 
 static uint8_t boot[] = {
 	/* ポート0にオリジナルの値が書かれるまで待機 */
@@ -90,6 +94,45 @@ static inline void spc_wait(uint8_t count) /* 非同期処理できるようにw
 #define spc_wait(c)		do { while (PORT0 != (c)); } while (0)
 #endif
 
+/* 不具合回避用 */
+static void vdp1wr(uint8_t value) __z88dk_fastcall __naked
+{
+__asm
+	push	af
+	push	bc
+	push	de
+	push	ix
+	push	iy
+	push	hl
+
+	di
+
+	/* RDSLTの引数設定 */
+	ld	a, (EXPTBL)
+	ld	hl, 0x0007	/* 書込み用VDPポートが書かれている場所 */
+
+	/* スロットコール */
+	ld	iy, (EXPTBL - 1)
+	ld	ix, RDSLT
+	call	CALSLT
+
+	/* VDPポート1に書込み */
+	inc	a		/* 戻り値(0x88か0x98の筈)に+1 */
+	ld	c, a
+	pop	hl
+	ld	a, l		/* lにvalueが格納されている */
+	out	(c), a
+
+	pop	iy
+	pop	ix
+	pop	de
+	pop	bc
+	pop	af
+
+	ret
+__endasm
+}
+
 int main(int argc, char *argv[])
 {
 	int fd = -1;
@@ -100,29 +143,28 @@ int main(int argc, char *argv[])
 	uint16_t i, j;
 	uint8_t port0, port1, port2, port3;
 
-	printf("SPC Player v0.2\n");
+	printf("SPC Player v0.30\n\n");
 
 	if (argc != 2) {
-		fprintf(stderr, "usage: spcplay <spc file>\n");
+		fprintf(stderr, "Usage: spcplay [FILE]\n");
 		return 1;
 	}
+
+	/* VDPの割り込み止めて割り込みでリセットがかかる不具合を回避 */
+	vdp1wr(*(uint8_t *)RG1SAV & 0b11011111);
+	vdp1wr(0b10000001);
 
 	/*
 	 * リセット
 	 */
 	RESET = 0;
-__asm
-	halt /* 少し待つ */
-	halt
-	halt
-	halt
-__endasm;
-	/* 割り込みでリセットがかかる不具合を回避 */
-	VDP1 = (*(uint8_t *)RG1SAV) & 0b11011111;
-	VDP1 = 0b10000001;
-
-	if ((PORT0 != 0xaa) || (PORT1 != 0xbb)) {
-		fprintf(stderr, "error: SHVC-SOUND not found.\n");
+	for (i = 1; i; i++) { /* タイムアウト50ミリ秒以上 高速機種に注意 */
+		if ((PORT0 == 0xaa) && (PORT1 == 0xbb)) {
+			break;
+		}
+	}
+	if (i == 0) {
+		fprintf(stderr, "Error: SHVC-SOUND not found.\n");
 		goto error;
 	}
 
@@ -132,60 +174,64 @@ __endasm;
 #if 0	/* -subtype=msxdos2でエラーしてしまう */
 	struct stat st;
 	if (stat(argv[1], &st)) {
-		fprintf(stderr, "error: no such file.\n");
+		fprintf(stderr, "Error: no such file.\n");
 		goto error;
 	}
 	if (st.st_size < 0x10200) {
-		fprintf(stderr, "error: invalid file.\n");
+		fprintf(stderr, "Error: invalid file.\n");
 		goto error;
 	}
 #endif
 	if ((fd = open(argv[1], O_RDONLY, 0644)) < 0) {
-		fprintf(stderr, "error: open failed.\n");
+		fprintf(stderr, "Error: open failed.\n");
 		goto error;
 	}
-	if (read(fd, buf, 29) != 29) {
-		fprintf(stderr, "error: read failed.\n");
+	if (read(fd, buf, 256) != 256) {
+		fprintf(stderr, "Error: read failed.\n");
 		goto error;
 	}
-	if (memcmp(buf, "SNES-SPC700 Sound File Data v", 29)) {
-		fprintf(stderr, "error: invalid file.\n");
+	if (memcmp(buf, "SNES-SPC700 Sound File Data", 27)) {
+		fprintf(stderr, "Error: invalid file.\n");
 		goto error;
 	}
 
 	/*
-	 * CPUレジスタ
+	 * ファイルヘッダー処理
 	 */
-	printf("loading CPU registers...\n");
-	if (lseek(fd, 0x25, SEEK_SET) != 0x25) {
-		fprintf(stderr, "error: lseek failed.\n");
-		goto error;
+	if (buf[0x23] == 0x1a) { /* ID666タグ有り */
+		printf("Game  : %.32s\n", &buf[0x4e]);
+		printf("Track : %.32s\n", &buf[0x2e]);
+		/* テキストフォーマットとバイナリーフォーマットの判定は困難 */
+		if (!buf[0xb0]) {
+			printf("Artist: %.32s\n", &buf[0xb1]); /* 恐らくテキスト */
+		} else if (isdigit(buf[0xac]) && isdigit(buf[0xad]) && isdigit(buf[0xae]) && isdigit(buf[0xaf]) && isdigit(buf[0xb0])) {
+			printf("Artist: %.32s\n", &buf[0xb1]); /* 恐らくテキスト */
+		} else {
+			printf("Artist: %.32s\n", &buf[0xb0]); /* 恐らくバイナリー */
+		}
+		printf("Dumper: %.16s\n\n", &buf[0x6e]);
 	}
-	if (read(fd, buf, 7) != 7) {
-		fprintf(stderr, "error: read failed.\n");
-		goto error;
-	}
-	pc = (buf[0] << 8) | buf[1]; /* プログラムカウンタ */
-	boot[BOOT_A] = buf[2]; /* Aレジスタ */
-	boot[BOOT_X] = buf[3]; /* Xレジスタ */
-	boot[BOOT_Y] = buf[4]; /* Yレジスタ */
-	psw = buf[5]; /* PSWレジスタ */
-	sp = buf[6]; /* スタックポインタ */
+	pc = (buf[0x25] << 8) | buf[0x26]; /* プログラムカウンタ */
+	boot[BOOT_A] = buf[0x27]; /* Aレジスタ */
+	boot[BOOT_X] = buf[0x28]; /* Xレジスタ */
+	boot[BOOT_Y] = buf[0x29]; /* Yレジスタ */
+	psw = buf[0x2a]; /* PSWレジスタ */
+	sp = buf[0x2b]; /* スタックポインタ */
 	if (sp < 0x03) {
 		sp = 0x03;
 	}
 	boot[BOOT_SP] = sp - 0x03;
 
 	/*
-	 * DSPレジスタ
+	 * DSPレジスタ RAMデータ処理より先にやっておく
 	 */
-	printf("loading DSP registers...\n");
+	printf("Loading DSP registers...\n");
 	if (lseek(fd, 0x10100, SEEK_SET) != 0x10100) {
-		fprintf(stderr, "error: lseek failed.\n");
+		fprintf(stderr, "Error: lseek failed.\n");
 		goto error;
 	}
 	if (read(fd, buf, 128) != 128) {
-		fprintf(stderr, "error: read failed.\n");
+		fprintf(stderr, "Error: read failed.\n");
 		goto error;
 	}
 	count = 0xcc; /* 初期値 */
@@ -211,18 +257,18 @@ __endasm;
 	/*
 	 * RAMデータ
 	 */
-	printf("loading RAM data...\n");
+	printf("Loading RAM data...\n");
 
 	/* ページ0部分 */
 	if (lseek(fd, 0x100, SEEK_SET) != 0x100) {
-		fprintf(stderr, "error: lseek failed.\n");
+		fprintf(stderr, "Error: lseek failed.\n");
 		goto error;
 	}
 	if (read(fd, buf, 4096) != 4096) {
-		fprintf(stderr, "error: read failed.\n");
+		fprintf(stderr, "Error: read failed.\n");
 		goto error;
 	}
-	count = ((count + 2) | 1); /* +2以上で0は不可という条件なのでこうする */
+	count = (count + 2) | 1; /* +2以上で0は不可という条件なのでこうする */
 	spc_setaddr(count, 0x0002);
 	spc_wait(count);
 	count = 0x00;
@@ -245,7 +291,7 @@ __endasm;
 	boot[BOOT_TIMER2] = buf[0xfc];
 
 	/* ページ1部分(スタック領域) */
-	count = ((count + 2) | 1); /* +2以上で0は不可という条件なのでこうする */
+	count = (count + 2) | 1; /* +2以上で0は不可という条件なのでこうする */
 	spc_setaddr(count, 0x0100);
 	spc_wait(count);
 	count = 0x00;
@@ -271,7 +317,7 @@ __endasm;
 	}
 	for (i = 0; i < 15; i++) { /* 最初の4096バイトは転送済なのでその分引く */
 		if (read(fd, buf, 4096) != 4096) {
-			fprintf(stderr, "error: read failed.\n");
+			fprintf(stderr, "Error: read failed.\n");
 			goto error;
 		}
 		for (j = 0; j < 4096; j++) {
@@ -290,7 +336,8 @@ __endasm;
 	/*
 	 * 起動
 	 */
-	count = ((count + 2) | 1); /* +2以上で0は不可という条件なのでこうする */
+	printf("Booting...\n");
+	count = (count + 2) | 1; /* +2以上で0は不可という条件なのでこうする */
 	spc_setaddr(count, BOOTADDR);
 	spc_wait(count);
 	count = 0x00;
@@ -299,9 +346,9 @@ __endasm;
 		spc_wait(count);
 		count++;
 	}
-	count = ((count + 2) | 1); /* +2以上で0は不可という条件なのでこうする */
+	count = (count + 2) | 1; /* +2以上で0は不可という条件なのでこうする */
 	if (count == port0) { /* PORT0の復元を開始トリガーとしているのでPORT0と一致した場合が値をずらす */
-		count++;
+		count = (count + 1) | 1;
 	}
 	PORT3 = BOOTADDR >> 8;
 	PORT2 = BOOTADDR & 0xff;
@@ -314,13 +361,13 @@ __endasm;
 	PORT0 = port0; /* PORT0の復元が開始トリガーなのでPORT0を最後に設定 */
 
 	/* ESCが押されるのを待つ */
-	printf("press ESC to exit.\n");
+	printf("\nPress ESC to exit.\n");
 	PPIC = (PPIC & 0b11110000) | 0x7;
 	while (PPIB & 0x4);
 
 	RESET = 0;
-	VDP1 = *(uint8_t *)RG1SAV;
-	VDP1 = 0b10000001;
+	vdp1wr(*(uint8_t *)RG1SAV); /* 元に戻す */
+	vdp1wr(0b10000001);
 
 	return 0;
 
@@ -329,8 +376,8 @@ error:
 		close(fd);
 	}
 	RESET = 0;
-	VDP1 = *(uint8_t *)RG1SAV;
-	VDP1 = 0b10000001;
+	vdp1wr(*(uint8_t *)RG1SAV); /* 元に戻す */
+	vdp1wr(0b10000001);
 
 	return 1;
 }
