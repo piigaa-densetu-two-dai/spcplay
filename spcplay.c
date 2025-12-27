@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -139,11 +140,19 @@ int main(int argc, char *argv[])
 	uint8_t buf[4096];
 	uint16_t pc;
 	uint8_t psw, sp;
+	char *ptr_track = NULL;
+	char *ptr_game = NULL;
+	char *ptr_dumper = NULL;
+	char *ptr_artist = NULL;
+	char *ptr_publisher = NULL;
+	char *ptr_year = NULL;
+	ssize_t xid6len;
+	uint8_t *ptr;
 	uint8_t count;
 	uint16_t i, j;
 	uint8_t port0, port1, port2, port3;
 
-	printf("SPC Player v0.30\n\n");
+	printf("SPC Player v0.5\n\n");
 
 	if (argc != 2) {
 		fprintf(stderr, "Usage: spcplay [FILE]\n");
@@ -186,6 +195,10 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Error: open failed.\n");
 		goto error;
 	}
+
+	/*
+	 * ファイルヘッダー処理
+	 */
 	if (read(fd, buf, 256) != 256) {
 		fprintf(stderr, "Error: read failed.\n");
 		goto error;
@@ -193,23 +206,6 @@ int main(int argc, char *argv[])
 	if (memcmp(buf, "SNES-SPC700 Sound File Data", 27)) {
 		fprintf(stderr, "Error: invalid file.\n");
 		goto error;
-	}
-
-	/*
-	 * ファイルヘッダー処理
-	 */
-	if (buf[0x23] == 0x1a) { /* ID666タグ有り */
-		printf("Game  : %.32s\n", &buf[0x4e]);
-		printf("Track : %.32s\n", &buf[0x2e]);
-		/* テキストフォーマットとバイナリーフォーマットの判定は困難 */
-		if (!buf[0xb0]) {
-			printf("Artist: %.32s\n", &buf[0xb1]); /* 恐らくテキスト */
-		} else if (isdigit(buf[0xac]) && isdigit(buf[0xad]) && isdigit(buf[0xae]) && isdigit(buf[0xaf]) && isdigit(buf[0xb0])) {
-			printf("Artist: %.32s\n", &buf[0xb1]); /* 恐らくテキスト */
-		} else {
-			printf("Artist: %.32s\n", &buf[0xb0]); /* 恐らくバイナリー */
-		}
-		printf("Dumper: %.16s\n\n", &buf[0x6e]);
 	}
 	pc = (buf[0x25] << 8) | buf[0x26]; /* プログラムカウンタ */
 	boot[BOOT_A] = buf[0x27]; /* Aレジスタ */
@@ -221,6 +217,111 @@ int main(int argc, char *argv[])
 		sp = 0x03;
 	}
 	boot[BOOT_SP] = sp - 0x03;
+
+	/*
+	 * ID666タグを処理
+	 */
+	if (buf[0x23] == 0x1a) { /* タグ有り */
+		ptr_track = (char *)&buf[0x2e];
+		ptr_game = (char *)&buf[0x4e];
+		ptr_dumper = (char *)&buf[0x6e];
+		/* テキストフォーマットとバイナリーフォーマットの判定は困難 */
+		if (!buf[0xb0]) {
+			ptr_artist = (char *)&buf[0xb1]; /* 恐らくテキスト */
+		} else if (isdigit(buf[0xac]) && isdigit(buf[0xad]) && isdigit(buf[0xae]) && isdigit(buf[0xaf]) && isdigit(buf[0xb0])) {
+			ptr_artist = (char *)&buf[0xb1]; /* 恐らくテキスト */
+		} else {
+			ptr_artist = (char *)&buf[0xb0]; /* 恐らくバイナリー */
+		}
+	}
+
+	/*
+	 * XID6タグを処理
+	 */
+	if (lseek(fd, 0x10200, SEEK_SET) != 0x10200) {
+		fprintf(stderr, "Error: lseek failed.\n");
+		goto error;
+	}
+	ptr = &buf[256];
+	xid6len = read(fd, ptr, sizeof(buf) - 256);
+	if ((8 <= xid6len) && (memcmp(ptr, "xid6", 4) == 0)) { /* タグ有り */
+		if (xid6len - 8 < *(uint32_t *)&ptr[4]) {
+			xid6len = 0; /* 長さが不正 */
+		} else {
+			xid6len = *(uint32_t *)&ptr[4];
+			ptr += 8;
+		}
+	} else {
+		xid6len = 0;
+	}
+	while (4 <= xid6len) {
+		if (ptr[1] == 0x00) { /* データ型 */
+			if (ptr[0] == 0x14) {
+				ptr_year = (char *)&ptr[2];
+			}
+			ptr += 4;
+			xid6len -= 4;
+		} else if (ptr[1] == 0x01) { /* 文字列型 */
+			if (xid6len <= 4) {
+				break; /* 文字列の実体が無い */
+			}
+			uint16_t len = (*(uint16_t *)&ptr[2] + 3) & ~3; /* 4バイト単位に切り上げ */
+			if (256 < len) {
+				break; /* 長さが不正 */
+			}
+			switch (ptr[0]) {
+				case 0x01:
+					ptr_track = (char *)&ptr[4];
+					break;
+				case 0x02:
+					ptr_game = (char *)&ptr[4];
+					break;
+				case 0x03:
+					ptr_artist = (char *)&ptr[4];
+					break;
+				case 0x04:
+					ptr_dumper = (char *)&ptr[4];
+					break;
+				case 0x13:
+					ptr_publisher = (char *)&ptr[4];
+					break;
+				default:
+					break;
+			}
+			ptr += (4 + len);
+			xid6len -= (4 + len);
+		} else if (ptr[1] == 0x04) { /* 整数型 */
+			ptr += 8;
+			xid6len -= 8;
+		} else { /* 型が不正 */
+			break;
+		}
+	}
+
+	/*
+	 * タグ情報の表示
+	 */
+#define IS_EXTENDED(ptr) (&buf[256] <= (ptr))
+	if (ptr_game) {
+		printf(IS_EXTENDED(ptr_game) ? "Game  : %.255s" : "Game  : %.32s", ptr_game);
+		if (ptr_publisher) {
+			printf(" - %.255s", ptr_publisher);
+		}
+		if (ptr_year) {
+			printf(" [%u]", *(uint16_t *)ptr_year);
+		}
+		printf("\n");
+	}
+	if (ptr_track) {
+		printf(IS_EXTENDED(ptr_track) ? "Track : %.255s\n" : "Track : %.32s\n", ptr_track);
+	}
+	if (ptr_artist) {
+		printf(IS_EXTENDED(ptr_artist) ? "Artist: %.255s\n" : "Artist: %.32s\n", ptr_artist);
+	}
+	if (ptr_dumper) {
+		printf(IS_EXTENDED(ptr_dumper) ? "Dumper: %.255s\n" : "Dumper: %.16s\n", ptr_dumper);
+	}
+	printf("\n");
 
 	/*
 	 * DSPレジスタ RAMデータ処理より先にやっておく
